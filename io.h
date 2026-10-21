@@ -26,6 +26,18 @@ along with this program; see the file COPYING. If not, see
 
 
 /**
+ * Allocate N bytes of zero-initialized memory with mmap.
+ **/
+void* mem_alloc(size_t n);
+
+
+/**
+ * Release memory obtained from mem_alloc.
+ **/
+void mem_free(void* ptr);
+
+
+/**
  * Read exactly N bytes from the given file descriptor.
  **/
 int io_nread(int fd, void* buf, size_t n);

@@ -96,6 +96,10 @@ sha256sum(int fd, uint8_t hash[SHA256_BLOCK_SIZE]) {
     if((n=pread(fd, buf, sizeof(buf), off)) < 0) {
       return -1;
     }
+    if(!n) {
+      errno = EIO;
+      return -1;
+    }
     sha256_update(&sha256, buf, n);
     off += n;
   }
@@ -122,7 +126,7 @@ zeropad(int fd, off_t off, off_t len) {
     return 0;
   }
 
-  if(!(buf=calloc(1, IO_COPY_BUFSIZE))) {
+  if(!(buf=mem_alloc(IO_COPY_BUFSIZE))) {
     return -1;
   }
 
@@ -132,12 +136,12 @@ zeropad(int fd, off_t off, off_t len) {
       n = off+len-i;
     }
     if(io_pwrite(fd, buf, n, i)) {
-      free(buf);
+      mem_free(buf);
       return -1;
     }
   }
 
-  free(buf);
+  mem_free(buf);
   return 0;
 }
 
@@ -195,7 +199,7 @@ self_get_elfsize(const char* path) {
   int fd;
 
   if((fd=open(path, O_RDONLY, 0)) < 0) {
-    return -1;
+    return 0;
   }
 
   size = self_get_elfsize_fd(fd);
@@ -237,30 +241,30 @@ self_extract_elf(int self_fd, int elf_fd) {
   }
 
   // Read SELF entries
-  if(!(entries=calloc(head.num_entries, sizeof(self_entry_t)))) {
+  if(!(entries=mem_alloc(head.num_entries * sizeof(self_entry_t)))) {
     return -1;
   }
   if(io_nread(self_fd, entries, head.num_entries * sizeof(self_entry_t))) {
-    free(entries);
+    mem_free(entries);
     return -1;
   }
 
   // Remember the position of the ELF header bundled within the SELF file
   if((elf_off=lseek(self_fd, 0, SEEK_CUR)) < 0) {
-    free(entries);
+    mem_free(entries);
     return -1;
   }
 
   // Read the ELF header
   if(io_nread(self_fd, &ehdr, sizeof(ehdr))) {
-    free(entries);
+    mem_free(entries);
     return -1;
   }
 
   // Sanity check the ELF header
   if(ehdr.e_ident[0] != 0x7f || ehdr.e_ident[1] != 'E' ||
      ehdr.e_ident[2] != 'L'  || ehdr.e_ident[3] != 'F') {
-    free(entries);
+    mem_free(entries);
     errno = ENOEXEC;
     return -1;
   }
@@ -273,13 +277,13 @@ self_extract_elf(int self_fd, int elf_fd) {
 
   // Skip ahead to the ELF program headers
   if(lseek(self_fd, elf_off + ehdr.e_phoff, SEEK_SET) < 0) {
-    free(entries);
+    mem_free(entries);
     return -1;
   }
 
   // Write the ELF header
   if(io_nwrite(elf_fd, &ehdr, sizeof(ehdr))) {
-    free(entries);
+    mem_free(entries);
     return -1;
   }
 
@@ -287,11 +291,11 @@ self_extract_elf(int self_fd, int elf_fd) {
   elf_size = ehdr.e_phoff + ehdr.e_phnum * sizeof(phdr);
   for(int i=0; i<ehdr.e_phnum; i++) {
     if(io_nread(self_fd, &phdr, sizeof(phdr))) {
-      free(entries);
+      mem_free(entries);
       return -1;
     }
     if(io_nwrite(elf_fd, &phdr, sizeof(phdr))) {
-      free(entries);
+      mem_free(entries);
       return -1;
     }
 
@@ -304,7 +308,7 @@ self_extract_elf(int self_fd, int elf_fd) {
       if(copy_segment(self_fd, head.file_size, elf_fd, phdr.p_offset,
 		      phdr.p_filesz)) {
 #if 0 // Some FSELFs are missing the version data, ignore error
-	free(entries);
+	mem_free(entries);
 	return -1;
 #endif
       }
@@ -327,17 +331,17 @@ self_extract_elf(int self_fd, int elf_fd) {
     // Decrypt and copy the segment
     if(entry->props.is_encrypted || entry->props.is_compressed) {
       if(decrypt_segment(self_fd, elf_fd, &phdr, i)) {
-	free(entries);
+	mem_free(entries);
 	return -1;
       }
     } else if(copy_segment(self_fd, entry->offset, elf_fd, phdr.p_offset,
 			   phdr.p_filesz)) {
-      free(entries);
+      mem_free(entries);
       return -1;
     }
   }
 
-  free(entries);
+  mem_free(entries);
 
   // Compute the SHA256 sum of the ELF
   if(sha256sum(elf_fd, hash)) {
