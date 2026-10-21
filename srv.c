@@ -35,6 +35,12 @@ along with this program; see the file COPYING. If not, see
 
 
 /**
+ * Maximum length of a command line, including its path argument.
+ **/
+#define FTP_LINE_MAX (PATH_MAX + 256)
+
+
+/**
  * Map names of commands to function entry points.
  **/
 typedef struct ftp_command {
@@ -98,53 +104,39 @@ static int nb_ftp_commands = (sizeof(commands)/sizeof(ftp_command_t));
 
 
 /**
- * Read a line from a file descriptor.
+ * Read a line from a file descriptor into a buffer. Returns 0 on success, 1 if
+ * the line did not fit in the buffer (it is then cut short), and -1 on error.
  **/
-static char*
-ftp_readline(int fd) {
-  int bufsize = 1024;
-  int position = 0;
-  char *buffer_backup;
-  char *buffer = calloc(bufsize, sizeof(char));
+static int
+ftp_readline(int fd, char *buf, size_t size) {
+  size_t position = 0;
+  int overflow = 0;
   char c;
-
-  if(!buffer) {
-    FTP_LOG_PERROR("malloc");
-    return NULL;
-  }
+  int len;
 
   while(1) {
-    int len = read(fd, &c, 1);
+    len = read(fd, &c, 1);
     if(len == -1 && errno == EINTR) {
       continue;
     }
 
     if(len <= 0) {
-      free(buffer);
-      return NULL;
+      return -1;
     }
 
     if(c == '\r') {
-      buffer[position] = '\0';
-      position = 0;
       continue;
     }
 
     if(c == '\n') {
-      return buffer;
+      buf[position] = '\0';
+      return overflow;
     }
 
-    buffer[position++] = c;
-
-    if(position >= bufsize) {
-      bufsize += 1024;
-      buffer_backup = buffer;
-      buffer = realloc(buffer, bufsize);
-      if(!buffer) {
-	FTP_LOG_PERROR("realloc");
-	free(buffer_backup);
-	return NULL;
-      }
+    if(position + 1 < size) {
+      buf[position++] = c;
+    } else {
+      overflow = 1;
     }
   }
 }
@@ -205,8 +197,8 @@ static void*
 ftp_thread(void *args) {
   ftp_env_t env;
   bool running;
-  char *line;
   char* cmd;
+  int status;
   int opt;
 
   env.data_fd     = -1;
@@ -216,6 +208,8 @@ ftp_thread(void *args) {
   env.type        = 'I';
   env.data_offset = 0;
   env.self2elf    = 1;
+  env.readbuf     = NULL;
+  env.linebuf     = NULL;
 
   strcpy(env.cwd, "/");
   memset(env.rename_path, 0, sizeof(env.rename_path));
@@ -227,28 +221,35 @@ ftp_thread(void *args) {
   }
 
   env.readbuf_size = IO_COPY_BUFSIZE;
-  if(!(env.readbuf=malloc(env.readbuf_size))) {
-    FTP_LOG_PERROR("malloc");
+  env.readbuf = mem_alloc(env.readbuf_size);
+  env.linebuf = mem_alloc(FTP_LINE_MAX);
+  if(!env.readbuf || !env.linebuf) {
+    FTP_LOG_PERROR("mmap");
     running = 0;
   } else {
     running = !ftp_greet(&env);
   }
 
   while(running) {
-    if(!(line=ftp_readline(env.active_fd))) {
+    if((status=ftp_readline(env.active_fd, env.linebuf, FTP_LINE_MAX)) < 0) {
       break;
     }
 
-    cmd = line;
-    if(!strncasecmp(line, "SITE ", 5)) {
+    if(status > 0) {
+      if(ftp_active_printf(&env, "500 Line too long\r\n")) {
+	break;
+      }
+      continue;
+    }
+
+    cmd = env.linebuf;
+    if(!strncasecmp(cmd, "SITE ", 5)) {
       cmd += 5;
     }
 
     if(ftp_execute(&env, cmd)) {
       running = false;
     }
-
-    free(line);
   }
 
   if(env.active_fd > 0) {
@@ -263,9 +264,8 @@ ftp_thread(void *args) {
     close(env.data_fd);
   }
 
-  if(env.readbuf) {
-    free(env.readbuf);
-  }
+  mem_free(env.readbuf);
+  mem_free(env.linebuf);
 
   pthread_exit(NULL);
 
@@ -369,10 +369,12 @@ ftp_serve(uint16_t port, int notify_user) {
     return -1;
   }
 
-  addr_len = sizeof(client_addr);
-
   while(1) {
+    addr_len = sizeof(client_addr);
     if((connfd=accept(srvfd, (struct sockaddr*)&client_addr, &addr_len)) < 0) {
+      if(errno == EINTR || errno == ECONNABORTED) {
+	continue;
+      }
       FTP_LOG_PERROR("accept");
       break;
     }

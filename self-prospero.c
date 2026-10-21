@@ -66,6 +66,9 @@ mmap_self(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
   // restore vnode pagerops
   if(kernel_setlong(KERNEL_ADDRESS_PAGER_TABLE + 2*8,
 		    KERNEL_ADDRESS_PAGER_OPS_VNODE)) {
+    if(data != MAP_FAILED) {
+      munmap(data, len);
+    }
     return MAP_FAILED;
   }
 

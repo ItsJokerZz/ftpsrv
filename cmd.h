@@ -37,6 +37,7 @@ typedef struct ftp_env {
   struct sockaddr_in data_addr;
   void *readbuf;
   size_t readbuf_size;
+  char *linebuf;
 } ftp_env_t;
 
 

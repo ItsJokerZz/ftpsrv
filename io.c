@@ -15,28 +15,77 @@ along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
 #include <errno.h>
-#include <stdlib.h>
+#include <stdint.h>
 #include <unistd.h>
 
 #include <sys/errno.h>
+#include <sys/mman.h>
 
 #include "io.h"
 
 
-int
-io_nread(int fd, void* buf, size_t n) {
-  int r;
+/**
+ * Size of the header in front of each allocation that holds its mapped length.
+ **/
+#define MEM_HEADER 16
 
-  while((r=read(fd, buf, n)) < 0) {
-    if(errno == EINTR) {
-      continue;
-    }
-    return -1;
+
+void*
+mem_alloc(size_t n) {
+  size_t len = n + MEM_HEADER;
+  void* base;
+
+  if(len < n) {
+    errno = ENOMEM;
+    return NULL;
   }
 
-  if(r != n) {
-    errno = EIO;
-    return -1;
+  base = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+	      -1, 0);
+  if(base == MAP_FAILED) {
+    return NULL;
+  }
+
+  *(size_t*)base = len;
+
+  return (uint8_t*)base + MEM_HEADER;
+}
+
+
+void
+mem_free(void* ptr) {
+  uint8_t* base;
+  int saved = errno;
+
+  if(!ptr) {
+    return;
+  }
+
+  base = (uint8_t*)ptr - MEM_HEADER;
+  munmap(base, *(size_t*)base);
+  errno = saved;
+}
+
+
+int
+io_nread(int fd, void* buf, size_t n) {
+  size_t done = 0;
+  ssize_t r;
+
+  while(done < n) {
+    if((r=read(fd, (uint8_t*)buf + done, n - done)) < 0) {
+      if(errno == EINTR) {
+	continue;
+      }
+      return -1;
+    }
+
+    if(!r) {
+      errno = EIO;
+      return -1;
+    }
+
+    done += r;
   }
 
   return 0;
@@ -45,18 +94,23 @@ io_nread(int fd, void* buf, size_t n) {
 
 int
 io_nwrite(int fd, const void* buf, size_t n) {
-  int r;
+  size_t done = 0;
+  ssize_t r;
 
-  while((r=write(fd, buf, n)) < 0) {
-    if(errno == EINTR) {
-      continue;
+  while(done < n) {
+    if((r=write(fd, (const uint8_t*)buf + done, n - done)) < 0) {
+      if(errno == EINTR) {
+	continue;
+      }
+      return -1;
     }
-    return -1;
-  }
 
-  if(r != n) {
-    errno = EIO;
-    return -1;
+    if(!r) {
+      errno = EIO;
+      return -1;
+    }
+
+    done += r;
   }
 
   return 0;
@@ -69,7 +123,7 @@ io_ncopy(int fd_in, int fd_out, size_t size) {
   void* buf;
   ssize_t n;
 
-  if(!(buf=malloc(IO_COPY_BUFSIZE))) {
+  if(!(buf=mem_alloc(IO_COPY_BUFSIZE))) {
     return -1;
   }
 
@@ -80,36 +134,41 @@ io_ncopy(int fd_in, int fd_out, size_t size) {
     }
 
     if(io_nread(fd_in, buf, n)) {
-      free(buf);
+      mem_free(buf);
       return -1;
     }
     if(io_nwrite(fd_out, buf, n)) {
-      free(buf);
+      mem_free(buf);
       return -1;
     }
 
     copied += n;
   }
 
-  free(buf);
+  mem_free(buf);
   return 0;
 }
 
 
 int
 io_pread(int fd, void* buf, size_t n, off_t off) {
-  int r;
+  size_t done = 0;
+  ssize_t r;
 
-  while((r=pread(fd, buf, n, off)) < 0) {
-    if(errno == EINTR) {
-      continue;
+  while(done < n) {
+    if((r=pread(fd, (uint8_t*)buf + done, n - done, off + done)) < 0) {
+      if(errno == EINTR) {
+	continue;
+      }
+      return -1;
     }
-    return -1;
-  }
 
-  if(r != n) {
-    errno = EIO;
-    return -1;
+    if(!r) {
+      errno = EIO;
+      return -1;
+    }
+
+    done += r;
   }
 
   return 0;
@@ -118,18 +177,23 @@ io_pread(int fd, void* buf, size_t n, off_t off) {
 
 int
 io_pwrite(int fd, const void* buf, size_t n, off_t off) {
-  int r;
+  size_t done = 0;
+  ssize_t r;
 
-  while((r=pwrite(fd, buf, n, off)) < 0) {
-    if(errno == EINTR) {
-      continue;
+  while(done < n) {
+    if((r=pwrite(fd, (const uint8_t*)buf + done, n - done, off + done)) < 0) {
+      if(errno == EINTR) {
+	continue;
+      }
+      return -1;
     }
-    return -1;
-  }
 
-  if(r != n) {
-    errno = EIO;
-    return -1;
+    if(!r) {
+      errno = EIO;
+      return -1;
+    }
+
+    done += r;
   }
 
   return 0;
@@ -142,7 +206,7 @@ io_pcopy(int fd_in, int fd_out, off_t off_in, off_t off_out, size_t size) {
   void* buf;
   ssize_t n;
 
-  if(!(buf=malloc(IO_COPY_BUFSIZE))) {
+  if(!(buf=mem_alloc(IO_COPY_BUFSIZE))) {
     return -1;
   }
 
@@ -153,11 +217,11 @@ io_pcopy(int fd_in, int fd_out, off_t off_in, off_t off_out, size_t size) {
     }
 
     if(io_pread(fd_in, buf, n, off_in)) {
-      free(buf);
+      mem_free(buf);
       return -1;
     }
     if(io_pwrite(fd_out, buf, n, off_out)) {
-      free(buf);
+      mem_free(buf);
       return -1;
     }
 
@@ -166,7 +230,6 @@ io_pcopy(int fd_in, int fd_out, off_t off_in, off_t off_out, size_t size) {
     copied += n;
   }
 
-  free(buf);
+  mem_free(buf);
   return 0;
 }
-

@@ -24,8 +24,9 @@ along with this program; see the file COPYING. If not, see
 
 #include <ps4/kernel.h>
 
-#include "srv.h"
+#include "io.h"
 #include "log.h"
+#include "srv.h"
 
 
 /**
@@ -44,19 +45,24 @@ find_pid(const char* name) {
     return -1;
   }
 
-  if(!(buf=malloc(buf_size))) {
-    FTP_LOG_PERROR("malloc");
+  buf_size += buf_size / 4;
+  if(!(buf=mem_alloc(buf_size))) {
+    FTP_LOG_PERROR("mmap");
     return -1;
   }
 
   if(sysctl(mib, 4, buf, &buf_size, 0, 0)) {
     FTP_LOG_PERROR("sysctl");
-    free(buf);
+    mem_free(buf);
     return -1;
   }
 
   for(uint8_t *ptr=buf; ptr<(buf+buf_size);) {
     int ki_structsize = *(int*)ptr;
+    if(ki_structsize <= 0) {
+      break;
+    }
+
     pid_t ki_pid = *(pid_t*)&ptr[72];
     char *ki_tdname = (char*)&ptr[447];
 
@@ -66,7 +72,7 @@ find_pid(const char* name) {
     }
   }
 
-  free(buf);
+  mem_free(buf);
 
   return pid;
 }
