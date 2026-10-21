@@ -22,6 +22,17 @@ along with this program; see the file COPYING. If not, see
 
 
 /**
+ * Facts that a client can ask for in machine-readable listings.
+ **/
+#define FTP_FACT_TYPE   (1 << 0)
+#define FTP_FACT_SIZE   (1 << 1)
+#define FTP_FACT_MODIFY (1 << 2)
+#define FTP_FACT_MODE   (1 << 3)
+#define FTP_FACT_ALL    (FTP_FACT_TYPE | FTP_FACT_SIZE | FTP_FACT_MODIFY | \
+                         FTP_FACT_MODE)
+
+
+/**
  * Data structure that captures the current state of a client.
  **/
 typedef struct ftp_env {
@@ -38,6 +49,8 @@ typedef struct ftp_env {
   void *readbuf;
   size_t readbuf_size;
   char *linebuf;
+  unsigned mlst_facts;
+  int epsv_all;
 } ftp_env_t;
 
 
@@ -50,15 +63,25 @@ typedef int (ftp_command_fn_t)(ftp_env_t* env, const char* arg);
 /**
  * Standard FTP commands.
  **/
+int ftp_cmd_ABOR(ftp_env_t *env, const char* arg);
 int ftp_cmd_APPE(ftp_env_t *env, const char* arg);
 int ftp_cmd_CDUP(ftp_env_t *env, const char* arg);
 int ftp_cmd_CWD (ftp_env_t *env, const char* arg);
 int ftp_cmd_DELE(ftp_env_t *env, const char* arg);
+int ftp_cmd_EPRT(ftp_env_t *env, const char* arg);
+int ftp_cmd_EPSV(ftp_env_t *env, const char* arg);
 int ftp_cmd_FEAT(ftp_env_t *env, const char* arg);
 int ftp_cmd_LIST(ftp_env_t *env, const char* arg);
+int ftp_cmd_MDTM(ftp_env_t *env, const char* arg);
+int ftp_cmd_MFF (ftp_env_t *env, const char* arg);
+int ftp_cmd_MFMT(ftp_env_t *env, const char* arg);
 int ftp_cmd_MKD (ftp_env_t *env, const char* arg);
 int ftp_cmd_MLSD(ftp_env_t *env, const char* arg);
+int ftp_cmd_MLST(ftp_env_t *env, const char* arg);
+int ftp_cmd_NLST(ftp_env_t *env, const char* arg);
 int ftp_cmd_NOOP(ftp_env_t *env, const char* arg);
+int ftp_cmd_OPTS(ftp_env_t *env, const char* arg);
+int ftp_cmd_PASS(ftp_env_t *env, const char* arg);
 int ftp_cmd_PASV(ftp_env_t *env, const char* arg);
 int ftp_cmd_PORT(ftp_env_t *env, const char* arg);
 int ftp_cmd_PWD (ftp_env_t *env, const char* arg);

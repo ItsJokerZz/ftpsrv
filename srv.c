@@ -53,15 +53,25 @@ typedef struct ftp_command {
  * Lookup table for FTP commands.
  **/
 static ftp_command_t commands[] = {
+  {"ABOR", ftp_cmd_ABOR},
   {"APPE", ftp_cmd_APPE},
   {"CDUP", ftp_cmd_CDUP},
   {"CWD",  ftp_cmd_CWD},
   {"DELE", ftp_cmd_DELE},
+  {"EPRT", ftp_cmd_EPRT},
+  {"EPSV", ftp_cmd_EPSV},
   {"FEAT", ftp_cmd_FEAT},
   {"LIST", ftp_cmd_LIST},
+  {"MDTM", ftp_cmd_MDTM},
+  {"MFF",  ftp_cmd_MFF},
+  {"MFMT", ftp_cmd_MFMT},
   {"MKD",  ftp_cmd_MKD},
   {"MLSD", ftp_cmd_MLSD},
+  {"MLST", ftp_cmd_MLST},
+  {"NLST", ftp_cmd_NLST},
   {"NOOP", ftp_cmd_NOOP},
+  {"OPTS", ftp_cmd_OPTS},
+  {"PASS", ftp_cmd_PASS},
   {"PASV", ftp_cmd_PASV},
   {"PORT", ftp_cmd_PORT},
   {"PWD",  ftp_cmd_PWD},
@@ -85,6 +95,7 @@ static ftp_command_t commands[] = {
 
   // duplicates that ensure commands are 4 bytes long
   {"XCUP", ftp_cmd_CDUP},
+  {"XCWD", ftp_cmd_CWD},
   {"XMKD", ftp_cmd_MKD},
   {"XPWD", ftp_cmd_PWD},
   {"XRMD", ftp_cmd_RMD},
@@ -139,6 +150,24 @@ ftp_readline(int fd, char *buf, size_t size) {
       overflow = 1;
     }
   }
+}
+
+
+/**
+ * Skip the telnet commands that a client may put in front of a command line,
+ * e.g., the interrupt and synch sequence it sends before ABOR.
+ **/
+static char*
+ftp_skip_telnet(char *line) {
+  while((uint8_t)line[0] == 0xFF && line[1]) {
+    if((uint8_t)line[1] >= 251 && (uint8_t)line[1] <= 254 && line[2]) {
+      line += 3;
+    } else {
+      line += 2;
+    }
+  }
+
+  return line;
 }
 
 
@@ -210,6 +239,8 @@ ftp_thread(void *args) {
   env.self2elf    = 1;
   env.readbuf     = NULL;
   env.linebuf     = NULL;
+  env.mlst_facts  = FTP_FACT_ALL;
+  env.epsv_all    = 0;
 
   strcpy(env.cwd, "/");
   memset(env.rename_path, 0, sizeof(env.rename_path));
@@ -242,7 +273,7 @@ ftp_thread(void *args) {
       continue;
     }
 
-    cmd = env.linebuf;
+    cmd = ftp_skip_telnet(env.linebuf);
     if(!strncasecmp(cmd, "SITE ", 5)) {
       cmd += 5;
     }

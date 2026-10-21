@@ -14,6 +14,7 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -30,6 +31,7 @@ along with this program; see the file COPYING. If not, see
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -342,20 +344,93 @@ ftp_quote(char *quoted, size_t size, const char *path) {
 
 
 /**
- * Enter passive mode.
+ * Set options for a command or an extension.
  **/
 int
-ftp_cmd_PASV(ftp_env_t *env, const char* arg) {
-  socklen_t sockaddr_len = sizeof(struct sockaddr_in);
-  struct sockaddr_in sockaddr;
-  uint32_t addr = 0;
-  uint16_t port = 0;
-  int ret = 0;
+ftp_cmd_OPTS(ftp_env_t *env, const char* arg) {
+  static const struct {
+    const char *name;
+    unsigned fact;
+  } facts[] = {
+    {"type", FTP_FACT_TYPE},
+    {"size", FTP_FACT_SIZE},
+    {"modify", FTP_FACT_MODIFY},
+    {"UNIX.mode", FTP_FACT_MODE},
+  };
+  unsigned enabled = 0;
+  const char *p;
+  size_t len;
+  char reply[128] = "";
+  size_t pos = 0;
 
-  if(getsockname(env->active_fd, (struct sockaddr*)&sockaddr, &sockaddr_len)) {
-    return ftp_perror(env);
+  if(!strncasecmp(arg, "UTF8", 4) && (!arg[4] || arg[4] == ' ')) {
+    p = arg + 4;
+    while(*p == ' ') {
+      p++;
+    }
+
+    if(!*p || !strcasecmp(p, "ON")) {
+      return ftp_active_printf(env, "200 UTF8 set to on\r\n");
+    } else if(!strcasecmp(p, "OFF")) {
+      return ftp_active_printf(env, "200 UTF8 set to off\r\n");
+    }
+
+    return ftp_active_printf(env, "501 Invalid argument to OPTS UTF8\r\n");
   }
-  addr = sockaddr.sin_addr.s_addr;
+
+  if(!strncasecmp(arg, "MLST", 4) && (!arg[4] || arg[4] == ' ')) {
+    p = arg + 4;
+    while(*p == ' ') {
+      p++;
+    }
+
+    while(*p) {
+      len = strcspn(p, ";");
+
+      for(size_t i=0; i<sizeof(facts)/sizeof(facts[0]); i++) {
+	if(len == strlen(facts[i].name) &&
+	   !strncasecmp(p, facts[i].name, len)) {
+	  enabled |= facts[i].fact;
+	}
+      }
+
+      p += len;
+      if(*p == ';') {
+	p++;
+      }
+    }
+
+    env->mlst_facts = enabled;
+    for(size_t i=0; i<sizeof(facts)/sizeof(facts[0]); i++) {
+      if(enabled & facts[i].fact) {
+	pos += snprintf(reply + pos, sizeof(reply) - pos, "%s;", facts[i].name);
+      }
+    }
+
+    return ftp_active_printf(env, "200 MLST OPTS %s\r\n", reply);
+  }
+
+  return ftp_active_printf(env, "501 Option not understood\r\n");
+}
+
+
+/**
+ * Provide a password, which is not needed.
+ **/
+int
+ftp_cmd_PASS(ftp_env_t *env, const char* arg) {
+  return ftp_active_printf(env, "230 User logged in\r\n");
+}
+
+
+/**
+ * Listen for a passive data connection, and obtain its port in network order.
+ **/
+static int
+ftp_passive_listen(ftp_env_t *env, uint16_t *port) {
+  struct sockaddr_in sockaddr;
+  socklen_t sockaddr_len = sizeof(sockaddr);
+  int err;
 
   memset(&env->data_addr, 0, sizeof(env->data_addr));
   if(env->passive_fd >= 0) {
@@ -364,7 +439,7 @@ ftp_cmd_PASV(ftp_env_t *env, const char* arg) {
   }
 
   if((env->passive_fd=socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-    return ftp_perror(env);
+    return -1;
   }
 
   memset(&sockaddr, 0, sockaddr_len);
@@ -372,27 +447,45 @@ ftp_cmd_PASV(ftp_env_t *env, const char* arg) {
   sockaddr.sin_addr.s_addr = htonl(INADDR_ANY);
   sockaddr.sin_port = htons(0);
 
-  if(bind(env->passive_fd, (struct sockaddr*)&sockaddr, sockaddr_len) != 0) {
-    ret = ftp_perror(env);
+  if(bind(env->passive_fd, (struct sockaddr*)&sockaddr, sockaddr_len) ||
+     listen(env->passive_fd, 1) ||
+     getsockname(env->passive_fd, (struct sockaddr*)&sockaddr,
+		 &sockaddr_len)) {
+    err = errno;
     close(env->passive_fd);
     env->passive_fd = -1;
-    return ret;
+    errno = err;
+    return -1;
   }
 
-  if(listen(env->passive_fd, 1) != 0) {
-    ret = ftp_perror(env);
-    close(env->passive_fd);
-    env->passive_fd = -1;
-    return ret;
+  *port = sockaddr.sin_port;
+
+  return 0;
+}
+
+
+/**
+ * Enter passive mode.
+ **/
+int
+ftp_cmd_PASV(ftp_env_t *env, const char* arg) {
+  socklen_t sockaddr_len = sizeof(struct sockaddr_in);
+  struct sockaddr_in sockaddr;
+  uint32_t addr = 0;
+  uint16_t port = 0;
+
+  if(env->epsv_all) {
+    return ftp_active_printf(env, "503 EPSV ALL is in effect\r\n");
   }
 
-  if(getsockname(env->passive_fd, (struct sockaddr*)&sockaddr, &sockaddr_len)) {
-    ret = ftp_perror(env);
-    close(env->passive_fd);
-    env->passive_fd = -1;
-    return ret;
+  if(getsockname(env->active_fd, (struct sockaddr*)&sockaddr, &sockaddr_len)) {
+    return ftp_perror(env);
   }
-  port = sockaddr.sin_port;
+  addr = sockaddr.sin_addr.s_addr;
+
+  if(ftp_passive_listen(env, &port)) {
+    return ftp_perror(env);
+  }
 
   return ftp_active_printf(env, "227 Entering Passive Mode (%hhu,%hhu,%hhu,%hhu,%hhu,%hhu).\r\n",
 			   (addr >> 0) & 0xFF,
@@ -401,6 +494,31 @@ ftp_cmd_PASV(ftp_env_t *env, const char* arg) {
 			   (addr >> 24) & 0xFF,
 			   (port >> 0) & 0xFF,
 			   (port >> 8) & 0xFF);
+}
+
+
+/**
+ * Enter extended passive mode.
+ **/
+int
+ftp_cmd_EPSV(ftp_env_t *env, const char* arg) {
+  uint16_t port = 0;
+
+  if(!strcasecmp(arg, "ALL")) {
+    env->epsv_all = 1;
+    return ftp_active_printf(env, "200 EPSV ALL OK\r\n");
+  }
+
+  if(arg[0] && strcmp(arg, "1")) {
+    return ftp_active_printf(env, "522 Network protocol not supported, use (1)\r\n");
+  }
+
+  if(ftp_passive_listen(env, &port)) {
+    return ftp_perror(env);
+  }
+
+  return ftp_active_printf(env, "229 Entering Extended Passive Mode (|||%hu|)\r\n",
+			   ntohs(port));
 }
 
 
@@ -509,11 +627,22 @@ int
 ftp_cmd_FEAT(ftp_env_t *env, const char *arg) {
   return ftp_active_printf(env,
                            "211-Features:\r\n"
+                           " EPRT\r\n"
+                           " EPSV\r\n"
+                           " MDTM\r\n"
+                           " MFF modify;UNIX.mode;\r\n"
+                           " MFMT\r\n"
                            " MLSD\r\n"
+                           " MLST type%s;size%s;modify%s;UNIX.mode%s;\r\n"
+                           " UTF8\r\n"
                            " KILL\r\n"
                            " MTRW\r\n"
                            " SELF\r\n"
-                           "211 End\r\n");
+                           "211 End\r\n",
+                           env->mlst_facts & FTP_FACT_TYPE ? "*" : "",
+                           env->mlst_facts & FTP_FACT_SIZE ? "*" : "",
+                           env->mlst_facts & FTP_FACT_MODIFY ? "*" : "",
+                           env->mlst_facts & FTP_FACT_MODE ? "*" : "");
 }
 
 
@@ -608,22 +737,50 @@ ftp_list_line(ftp_env_t *env, const char *path, const char *name,
 
 
 /**
+ * Describe a path with the facts of a machine-readable listing that the client
+ * has asked for.
+ **/
+static void
+ftp_mlst_facts(ftp_env_t *env, const char *path, const struct stat *st,
+	       char *facts, size_t size) {
+  char timebuf[20];
+  struct tm tm;
+  time_t mtime = ftp_mtime(st);
+  size_t len = 0;
+
+  gmtime_r(&mtime, &tm);
+  strftime(timebuf, sizeof(timebuf), "%Y%m%d%H%M%S", &tm);
+
+  facts[0] = '\0';
+  if(env->mlst_facts & FTP_FACT_TYPE) {
+    len += snprintf(facts + len, size - len, "type=%s;",
+		    S_ISDIR(st->st_mode) ? "dir" : "file");
+  }
+  if(env->mlst_facts & FTP_FACT_SIZE) {
+    len += snprintf(facts + len, size - len, "size=%llu;",
+		    (unsigned long long)ftp_file_size(env, path, st));
+  }
+  if(env->mlst_facts & FTP_FACT_MODIFY) {
+    len += snprintf(facts + len, size - len, "modify=%s;", timebuf);
+  }
+  if(env->mlst_facts & FTP_FACT_MODE) {
+    len += snprintf(facts + len, size - len, "UNIX.mode=%04o;",
+		    (unsigned)(st->st_mode & 07777));
+  }
+}
+
+
+/**
  * Transmit a machine-readable line that describes a path.
  **/
 static int
 ftp_mlsd_line(ftp_env_t *env, const char *path, const char *name,
 	      const struct stat *st) {
-  char timebuf[20];
-  struct tm tm;
-  time_t mtime = ftp_mtime(st);
+  char facts[128];
 
-  gmtime_r(&mtime, &tm);
-  strftime(timebuf, sizeof(timebuf), "%Y%m%d%H%M%S", &tm);
+  ftp_mlst_facts(env, path, st, facts, sizeof(facts));
 
-  return ftp_data_printf(env, "type=%s;size=%llu;modify=%s; %s\r\n",
-			 S_ISDIR(st->st_mode) ? "dir" : "file",
-			 (unsigned long long)ftp_file_size(env, path, st),
-			 timebuf, name);
+  return ftp_data_printf(env, "%s %s\r\n", facts, name);
 }
 
 
@@ -711,6 +868,252 @@ ftp_cmd_LIST(ftp_env_t *env, const char* arg) {
 
 
 /**
+ * Obtain the time of last modification of a given path.
+ **/
+int
+ftp_cmd_MDTM(ftp_env_t *env, const char* arg) {
+  char pathbuf[PATH_MAX];
+  char timebuf[20];
+  struct stat st;
+  struct tm tm;
+  time_t mtime;
+
+  if(!arg[0]) {
+    return ftp_active_printf(env, "501 Usage: MDTM <FILENAME>\r\n");
+  }
+
+  ftp_abspath(env, pathbuf, arg);
+  if(stat(pathbuf, &st)) {
+    return ftp_perror(env);
+  }
+
+  mtime = ftp_mtime(&st);
+  gmtime_r(&mtime, &tm);
+  strftime(timebuf, sizeof(timebuf), "%Y%m%d%H%M%S", &tm);
+
+  return ftp_active_printf(env, "213 %s\r\n", timebuf);
+}
+
+
+/**
+ * Convert a time in UTC, broken down into fields, to seconds since the epoch.
+ **/
+static time_t
+ftp_timegm(const struct tm *tm) {
+  int64_t y = tm->tm_year + 1900;
+  int64_t m = tm->tm_mon + 1;
+  int64_t d = tm->tm_mday;
+  int64_t era, yoe, doy, doe;
+
+  if(m <= 2) {
+    y--;
+  }
+
+  era = (y >= 0 ? y : y - 399) / 400;
+  yoe = y - era * 400;
+  doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+
+  return (era * 146097 + doe - 719468) * 86400 + tm->tm_hour * 3600 +
+    tm->tm_min * 60 + tm->tm_sec;
+}
+
+
+/**
+ * Parse a time in UTC on the form YYYYMMDDHHMMSS, optionally followed by a
+ * fraction of a second, which is ignored.
+ **/
+static int
+ftp_parse_time(const char *str, time_t *out) {
+  struct tm tm;
+  int f[6] = {0};
+  int len[6] = {4, 2, 2, 2, 2, 2};
+  int pos = 0;
+
+  for(int i=0; i<6; i++) {
+    for(int j=0; j<len[i]; j++, pos++) {
+      if(!isdigit((unsigned char)str[pos])) {
+	return -1;
+      }
+      f[i] = f[i] * 10 + (str[pos] - '0');
+    }
+  }
+
+  if(str[pos] == '.') {
+    pos++;
+    while(isdigit((unsigned char)str[pos])) {
+      pos++;
+    }
+  }
+
+  if(str[pos] || f[1] < 1 || f[1] > 12 || f[2] < 1 || f[2] > 31 ||
+     f[3] > 23 || f[4] > 59 || f[5] > 60) {
+    return -1;
+  }
+
+  memset(&tm, 0, sizeof(tm));
+  tm.tm_year = f[0] - 1900;
+  tm.tm_mon = f[1] - 1;
+  tm.tm_mday = f[2];
+  tm.tm_hour = f[3];
+  tm.tm_min = f[4];
+  tm.tm_sec = f[5];
+  *out = ftp_timegm(&tm);
+
+  return 0;
+}
+
+
+/**
+ * Set the time of last modification of a path and keep its access time.
+ **/
+static int
+ftp_set_mtime(const char *path, time_t mtime) {
+  struct timeval tv[2];
+  struct stat st;
+
+  if(stat(path, &st)) {
+    return -1;
+  }
+
+  tv[0].tv_sec = st.st_atim.tv_sec;
+  tv[0].tv_usec = st.st_atim.tv_nsec / 1000;
+  tv[1].tv_sec = mtime;
+  tv[1].tv_usec = 0;
+
+  return utimes(path, tv);
+}
+
+
+/**
+ * Set the time of last modification of a given path.
+ **/
+int
+ftp_cmd_MFMT(ftp_env_t *env, const char* arg) {
+  char pathbuf[PATH_MAX];
+  char timebuf[32];
+  const char *path;
+  time_t mtime;
+  size_t len;
+
+  if(!(path=strchr(arg, ' '))) {
+    return ftp_active_printf(env, "501 Usage: MFMT <TIME> <PATH>\r\n");
+  }
+
+  len = path - arg;
+  while(*path == ' ') {
+    path++;
+  }
+
+  if(!path[0] || len >= sizeof(timebuf)) {
+    return ftp_active_printf(env, "501 Usage: MFMT <TIME> <PATH>\r\n");
+  }
+
+  memcpy(timebuf, arg, len);
+  timebuf[len] = '\0';
+  if(ftp_parse_time(timebuf, &mtime)) {
+    return ftp_active_printf(env, "501 Invalid time\r\n");
+  }
+
+  ftp_abspath(env, pathbuf, path);
+  if(ftp_set_mtime(pathbuf, mtime)) {
+    return ftp_perror(env);
+  }
+
+  return ftp_active_printf(env, "213 Modify=%.14s; %s\r\n", timebuf, path);
+}
+
+
+/**
+ * Modify the facts of a given path.
+ **/
+int
+ftp_cmd_MFF(ftp_env_t *env, const char* arg) {
+  char pathbuf[PATH_MAX];
+  char facts[128];
+  const char *path;
+  char reply[128] = "";
+  char *fact;
+  char *stop;
+  char *end;
+  char *eq;
+  time_t mtime = 0;
+  long mode = 0;
+  int have_mtime = 0;
+  int have_mode = 0;
+  size_t len;
+
+  if(!(path=strchr(arg, ' '))) {
+    return ftp_active_printf(env, "501 Usage: MFF <FACTS> <PATH>\r\n");
+  }
+
+  len = path - arg;
+  while(*path == ' ') {
+    path++;
+  }
+
+  if(!path[0] || len >= sizeof(facts)) {
+    return ftp_active_printf(env, "501 Usage: MFF <FACTS> <PATH>\r\n");
+  }
+
+  memcpy(facts, arg, len);
+  facts[len] = '\0';
+
+  for(fact=facts; *fact; fact=end) {
+    end = fact + strcspn(fact, ";");
+    if(*end) {
+      *end++ = '\0';
+    }
+
+    if(!(eq=strchr(fact, '='))) {
+      continue;
+    }
+    *eq++ = '\0';
+
+    if(!strcasecmp(fact, "modify")) {
+      if(ftp_parse_time(eq, &mtime)) {
+	return ftp_active_printf(env, "501 Invalid time\r\n");
+      }
+      have_mtime = 1;
+    } else if(!strcasecmp(fact, "UNIX.mode")) {
+      mode = strtol(eq, &stop, 8);
+      if(!eq[0] || *stop || mode < 0 || mode > 07777) {
+	return ftp_active_printf(env, "501 Invalid mode\r\n");
+      }
+      have_mode = 1;
+    }
+  }
+
+  if(!have_mtime && !have_mode) {
+    return ftp_active_printf(env, "504 No supported facts to modify\r\n");
+  }
+
+  ftp_abspath(env, pathbuf, path);
+  if(have_mode && chmod(pathbuf, mode)) {
+    return ftp_perror(env);
+  }
+  if(have_mtime && ftp_set_mtime(pathbuf, mtime)) {
+    return ftp_perror(env);
+  }
+
+  len = 0;
+  if(have_mtime) {
+    struct tm tm;
+
+    gmtime_r(&mtime, &tm);
+    len += strftime(reply + len, sizeof(reply) - len, "Modify=%Y%m%d%H%M%S;",
+		    &tm);
+  }
+  if(have_mode) {
+    len += snprintf(reply + len, sizeof(reply) - len, "UNIX.mode=%04o;",
+		    (unsigned)mode);
+  }
+
+  return ftp_active_printf(env, "213 %s %s\r\n", reply, path);
+}
+
+
+/**
  * Create a new directory at a given path.
  **/
 int
@@ -776,6 +1179,80 @@ ftp_cmd_MLSD(ftp_env_t *env, const char *arg) {
 
 
 /**
+ * Transmit the machine-readable facts of a single path.
+ **/
+int
+ftp_cmd_MLST(ftp_env_t *env, const char *arg) {
+  char pathbuf[PATH_MAX];
+  struct stat statbuf;
+  char facts[128];
+
+  ftp_abspath(env, pathbuf, arg[0] ? arg : env->cwd);
+  if(stat(pathbuf, &statbuf)) {
+    return ftp_perror(env);
+  }
+
+  ftp_mlst_facts(env, pathbuf, &statbuf, facts, sizeof(facts));
+
+  return ftp_active_printf(env,
+			   "250- Listing %s\r\n"
+			   " %s %s\r\n"
+			   "250 End\r\n",
+			   arg[0] ? arg : env->cwd, facts, pathbuf);
+}
+
+
+/**
+ * Transfer a list of file names.
+ **/
+int
+ftp_cmd_NLST(ftp_env_t *env, const char *arg) {
+  char pathbuf[PATH_MAX];
+  struct dirent *ent;
+  struct stat statbuf;
+  const char *p;
+  DIR *dir = NULL;
+  int failed = 0;
+  int all;
+  int err;
+
+  p = ftp_list_path(arg, &all);
+  ftp_abspath(env, pathbuf, p ? p : env->cwd);
+  if(stat(pathbuf, &statbuf)) {
+    return ftp_perror(env);
+  }
+
+  if(S_ISDIR(statbuf.st_mode) && !(dir=opendir(pathbuf))) {
+    return ftp_perror(env);
+  }
+
+  if(ftp_data_open(env)) {
+    err = ftp_perror(env);
+    if(dir) {
+      closedir(dir);
+    }
+    return err;
+  }
+
+  ftp_active_printf(env, "150 Opening data transfer\r\n");
+
+  if(!dir) {
+    failed = ftp_data_printf(env, "%.1024s\r\n", p);
+  }
+
+  while(!failed && dir && (ent=readdir(dir))) {
+    if(!all && (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, ".."))) {
+      continue;
+    }
+
+    failed = ftp_data_printf(env, "%s\r\n", ent->d_name);
+  }
+
+  return ftp_list_finish(env, dir, failed);
+}
+
+
+/**
  * No operation.
  **/
 int
@@ -785,27 +1262,20 @@ ftp_cmd_NOOP(ftp_env_t *env, const char* arg) {
 
 
 /**
- * Establish a data connection with client.
+ * Remember where to connect for the next data transfer, provided that it is
+ * the address of the client. Returns 1 for any other address, and -1 on error.
  **/
-int
-ftp_cmd_PORT(ftp_env_t *env, const char* arg) {
+static int
+ftp_set_data_addr(ftp_env_t *env, uint32_t s_addr, uint16_t port) {
   struct sockaddr_in peer_addr;
   socklen_t peer_len = sizeof(peer_addr);
-  uint8_t addr[6];
-  uint32_t s_addr;
-
-  if(sscanf(arg, "%hhu,%hhu,%hhu,%hhu,%hhu,%hhu",
-	    addr, addr+1, addr+2, addr+3, addr+4, addr+5) != 6) {
-    return ftp_active_printf(env, "501 Usage: PORT <addr>\r\n");
-  }
 
   if(getpeername(env->active_fd, (struct sockaddr*)&peer_addr, &peer_len)) {
-    return ftp_perror(env);
+    return -1;
   }
 
-  memcpy(&s_addr, addr, sizeof(s_addr));
   if(s_addr != peer_addr.sin_addr.s_addr) {
-    return ftp_active_printf(env, "504 Illegal PORT command\r\n");
+    return 1;
   }
 
   if(env->data_fd != -1) {
@@ -820,9 +1290,91 @@ ftp_cmd_PORT(ftp_env_t *env, const char* arg) {
   memset(&env->data_addr, 0, sizeof(env->data_addr));
   env->data_addr.sin_family = AF_INET;
   env->data_addr.sin_addr.s_addr = s_addr;
-  env->data_addr.sin_port = htons((addr[4] << 8) | addr[5]);
+  env->data_addr.sin_port = port;
+
+  return 0;
+}
+
+
+/**
+ * Establish a data connection with client.
+ **/
+int
+ftp_cmd_PORT(ftp_env_t *env, const char* arg) {
+  uint8_t addr[6];
+  uint32_t s_addr;
+  int ret;
+
+  if(env->epsv_all) {
+    return ftp_active_printf(env, "503 EPSV ALL is in effect\r\n");
+  }
+
+  if(sscanf(arg, "%hhu,%hhu,%hhu,%hhu,%hhu,%hhu",
+	    addr, addr+1, addr+2, addr+3, addr+4, addr+5) != 6) {
+    return ftp_active_printf(env, "501 Usage: PORT <addr>\r\n");
+  }
+
+  memcpy(&s_addr, addr, sizeof(s_addr));
+  ret = ftp_set_data_addr(env, s_addr, htons((addr[4] << 8) | addr[5]));
+  if(ret < 0) {
+    return ftp_perror(env);
+  } else if(ret > 0) {
+    return ftp_active_printf(env, "504 Illegal PORT command\r\n");
+  }
 
   return ftp_active_printf(env, "200 PORT command successful.\r\n");
+}
+
+
+/**
+ * Establish a data connection with client using an extended address.
+ **/
+int
+ftp_cmd_EPRT(ftp_env_t *env, const char* arg) {
+  char buf[64];
+  char *field[3];
+  struct in_addr in;
+  unsigned long port;
+  char *end;
+  char *p;
+  int ret;
+
+  if(env->epsv_all) {
+    return ftp_active_printf(env, "503 EPSV ALL is in effect\r\n");
+  }
+
+  if(!arg[0] || strlen(arg) >= sizeof(buf)) {
+    return ftp_active_printf(env, "501 Usage: EPRT |<af>|<addr>|<port>|\r\n");
+  }
+
+  memcpy(buf, arg, strlen(arg) + 1);
+  p = buf + 1;
+  for(int i=0; i<3; i++) {
+    field[i] = p;
+    if(!(p=strchr(p, buf[0]))) {
+      return ftp_active_printf(env, "501 Usage: EPRT |<af>|<addr>|<port>|\r\n");
+    }
+    *p++ = '\0';
+  }
+
+  if(!strcmp(field[0], "2")) {
+    return ftp_active_printf(env, "522 Network protocol not supported, use (1)\r\n");
+  }
+
+  port = strtoul(field[2], &end, 10);
+  if(strcmp(field[0], "1") || inet_pton(AF_INET, field[1], &in) != 1 ||
+     !field[2][0] || *end || !port || port > 65535) {
+    return ftp_active_printf(env, "501 Usage: EPRT |<af>|<addr>|<port>|\r\n");
+  }
+
+  ret = ftp_set_data_addr(env, in.s_addr, htons(port));
+  if(ret < 0) {
+    return ftp_perror(env);
+  } else if(ret > 0) {
+    return ftp_active_printf(env, "504 Illegal EPRT command\r\n");
+  }
+
+  return ftp_active_printf(env, "200 EPRT command successful.\r\n");
 }
 
 
@@ -1147,6 +1699,16 @@ ftp_cmd_STOR(ftp_env_t *env, const char* arg) {
   }
 
   return ftp_active_printf(env, "226 Data transfer complete\r\n");
+}
+
+
+/**
+ * Abort the current transfer, which has always finished by the time that a
+ * command is read.
+ **/
+int
+ftp_cmd_ABOR(ftp_env_t *env, const char* arg) {
+  return ftp_active_printf(env, "226 No transfer to abort\r\n");
 }
 
 
